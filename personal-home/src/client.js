@@ -18,7 +18,8 @@
   let requestController;
   let cleanupPage = () => {};
   let enteringAnimation;
-  let leavingAnimation;
+  let pageTransition;
+  let fallbackTransition;
 
   function makeKey() { return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`; }
   function absoluteURLs(root, base) {
@@ -102,7 +103,7 @@
     links.forEach(link => { const selected=link===active; link.classList.toggle('current',selected); if(selected)link.setAttribute('aria-current','page');else link.removeAttribute('aria-current'); });
     positionLens(nav,true);
   }
-  function refreshLenses() { $$('.main-nav, .collection-tabs').forEach(nav=>positionLens(nav)); }
+  function refreshLenses() { $$('.main-nav, #main .collection-tabs').forEach(nav=>positionLens(nav)); }
   refreshLenses();
   window.addEventListener('resize',refreshLenses,{passive:true});
   document.fonts?.ready.then(refreshLenses);
@@ -124,8 +125,9 @@
       search.addEventListener('input',()=>applySearch(),{signal:controller.signal});
       $('#reset-search')?.addEventListener('click',()=>{search.value='';applySearch();search.focus();},{signal:controller.signal});
     }
-    $$('.collection-tabs').forEach(nav=>{if(!lenses.has(nav))positionLens(nav);});
-    glassEffects.refresh();
+    $$('.collection-tabs',main).forEach(nav=>{if(!lenses.has(nav))positionLens(nav);});
+    // Prepare the optical filters before the new page is painted or captured.
+    glassEffects.refresh({ immediate:true });
   }
   mountPage(renderedURL);
 
@@ -141,8 +143,12 @@
     if(anchor){anchor.setAttribute('tabindex','-1');anchor.focus({preventScroll:true});anchor.scrollIntoView({behavior:'instant',block:'start'});}else window.scrollTo({left:0,top:0,behavior:'instant'});
   }
   function samePage(a,b) { return a.pathname===b.pathname&&a.search===b.search; }
+  function stopPageTransition(){
+    pageTransition?.skipTransition();enteringAnimation?.cancel();
+    if(fallbackTransition){fallbackTransition.animation?.cancel();fallbackTransition.layer.remove();fallbackTransition=null;}
+  }
   function cancelNavigation() {
-    navigationId++;requestController?.abort();leavingAnimation?.cancel();enteringAnimation?.cancel();
+    navigationId++;requestController?.abort();stopPageTransition();
     main.removeAttribute('aria-busy');document.documentElement.classList.remove('is-navigating');anticipateNav(renderedURL);
   }
   function eligible(link) {
@@ -172,6 +178,7 @@
   }
   async function navigate(url,{popState=null,pop=false}={}) {
     const id=++navigationId;
+    stopPageTransition();
     requestController?.abort(); requestController=new AbortController();
     const controller=requestController;
     const timeout=setTimeout(()=>controller.abort(),12000);
@@ -185,28 +192,55 @@
       const next=new DOMParser().parseFromString(html,'text/html');
       absoluteURLs(next,url);
       const nextMain=$('#main',next);
-      enteringAnimation?.cancel();leavingAnimation?.cancel();
-      if(!reducedMotion.matches&&typeof main.animate==='function') {
-        leavingAnimation=main.animate([{opacity:getComputedStyle(main).opacity,transform:'translateY(0)'},{opacity:0,transform:'translateY(-5px)'}],{duration:100,easing:'ease-out',fill:'forwards'});
-        await leavingAnimation.finished.catch(()=>{});
+      // The old page stays fully visible while HTML and its images are prepared.
+      await prepareImages(nextMain,controller.signal);
+      if(id!==navigationId)return;
+      let committed=false;
+      const commitPage=()=>{
+        if(id!==navigationId||committed)return;
+        committed=true;
+        const oldTabs=$('.collection-tabs');const newTabs=$('.collection-tabs',nextMain);
+        if(oldTabs&&newTabs){syncNav(oldTabs,newTabs,true);newTabs.replaceWith(oldTabs);}
+        if(pop){currentKey=popState?.siteKey||makeKey();historyIndex=popState?.siteIndex||0;}
+        else {currentKey=makeKey();historyIndex++;history.pushState({siteKey:currentKey,siteIndex:historyIndex},'',url);}
+        main.replaceChildren(...nextMain.childNodes);
+        $$('[data-local-fragment]').forEach(link=>{link.href=new URL(link.dataset.localFragment,url).href;});
+        renderedURL=new URL(url);
+        updateMetadata(next);
+        syncNav($('.main-nav'),$('.main-nav',next),true);
+        const contact=$('.header-contact');const nextContact=$('.header-contact',next);
+        if(nextContact?.hasAttribute('aria-current'))contact?.setAttribute('aria-current','page');else contact?.removeAttribute('aria-current');
+        mountPage(url);
+        const heading=$('h1',main);heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});
+        scrollToTarget(url,pop?(scrollPositions.get(currentKey)||popState?.sitePosition):null);
+      };
+      if(!reducedMotion.matches&&typeof document.startViewTransition==='function'){
+        document.documentElement.dataset.pageTransition='native';
+        // Capture the current viewport, then reveal the new one over it. There is
+        // no frame where both pages are transparent, including during scroll reset.
+        const transition=document.startViewTransition(commitPage);
+        pageTransition=transition;
+        transition.ready.catch(()=>{});
+        transition.finished.catch(()=>{}).finally(()=>{if(pageTransition===transition)pageTransition=null;});
+        await transition.updateCallbackDone;
+      }else{
+        document.documentElement.dataset.pageTransition=reducedMotion.matches?'reduced':'snapshot';
+        const snapshot=!reducedMotion.matches&&typeof main.animate==='function'?capturePage():null;
+        commitPage();
+        // The previous viewport fades over the fully painted next page. Both the
+        // native and fallback paths retain an opaque frame throughout the change.
+        if(snapshot){
+          const style=getComputedStyle(document.documentElement);
+          const options={
+            duration:parseFloat(style.getPropertyValue('--page-duration'))||280,
+            easing:style.getPropertyValue('--page-ease').trim()||'ease-out'
+          };
+          const animation=snapshot.animate([{opacity:1},{opacity:0}],options);
+          const transition={layer:snapshot,animation};fallbackTransition=transition;
+          enteringAnimation=main.animate([{transform:`translateY(${style.getPropertyValue('--page-shift').trim()||'5px'})`},{transform:'translateY(0)'}],options);
+          animation.finished.catch(()=>{}).finally(()=>{snapshot.remove();if(fallbackTransition===transition)fallbackTransition=null;});
+        }
       }
-      if(id!==navigationId){leavingAnimation?.cancel();return;}
-      const oldTabs=$('.collection-tabs');const newTabs=$('.collection-tabs',nextMain);
-      if(oldTabs&&newTabs){syncNav(oldTabs,newTabs,true);newTabs.replaceWith(oldTabs);}
-      if(pop){currentKey=popState?.siteKey||makeKey();historyIndex=popState?.siteIndex||0;}
-      else {currentKey=makeKey();historyIndex++;history.pushState({siteKey:currentKey,siteIndex:historyIndex},'',url);}
-      main.replaceChildren(...nextMain.childNodes);
-      $$('[data-local-fragment]').forEach(link=>{link.href=new URL(link.dataset.localFragment,url).href;});
-      renderedURL=new URL(url);
-      updateMetadata(next);
-      syncNav($('.main-nav'),$('.main-nav',next),true);
-      const contact=$('.header-contact');const nextContact=$('.header-contact',next);
-      if(nextContact?.hasAttribute('aria-current'))contact?.setAttribute('aria-current','page');else contact?.removeAttribute('aria-current');
-      mountPage(url);
-      leavingAnimation?.cancel();
-      const heading=$('h1',main);heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});
-      scrollToTarget(url,pop?(scrollPositions.get(currentKey)||popState?.sitePosition):null);
-      if(!reducedMotion.matches&&typeof main.animate==='function')enteringAnimation=main.animate([{opacity:0,transform:'translateY(8px)'},{opacity:1,transform:'translateY(0)'}],{duration:240,easing:'cubic-bezier(.2,.7,.2,1)'});
     } catch(error) {
       if(id!==navigationId)return;
       // A network, authentication, or deployment change uses the original working HTML URL.
@@ -215,6 +249,46 @@
       clearTimeout(timeout);
       if(id===navigationId){main.removeAttribute('aria-busy');document.documentElement.classList.remove('is-navigating');}
     }
+  }
+
+  function capturePage(){
+    const layer=document.createElement('div');layer.className='page-snapshot';layer.inert=true;layer.setAttribute('aria-hidden','true');
+    const background=document.createElement('div');const bodyStyle=getComputedStyle(document.body);
+    background.style.cssText=`position:absolute;left:0;top:${-scrollY}px;width:100%;height:${document.body.scrollHeight}px;background-color:${bodyStyle.backgroundColor};background-image:${bodyStyle.backgroundImage}`;
+    layer.append(background);
+    for(const element of[main,$('.site-footer')].filter(Boolean)){
+      const rect=element.getBoundingClientRect();const copy=element.cloneNode(true);
+      copy.removeAttribute('id');$$('[id]',copy).forEach(node=>node.removeAttribute('id'));
+      Object.assign(copy.style,{position:'absolute',margin:'0',top:`${rect.top}px`,left:`${rect.left}px`,width:`${rect.width}px`,maxWidth:'none',transform:'none'});
+      layer.append(copy);
+    }
+    // Keep independent copies of the old material maps; mounting the next page
+    // can release its previous filters without changing the outgoing picture.
+    const ns='http://www.w3.org/2000/svg';const svg=document.createElementNS(ns,'svg');
+    svg.setAttribute('width','0');svg.setAttribute('height','0');const defs=document.createElementNS(ns,'defs');svg.append(defs);
+    const replacements=new Map();
+    for(const filter of $$('filter[id^="clear-glass-"]')){
+      const copy=filter.cloneNode(true);const id=`${filter.id}-snapshot-${navigationId}`;copy.id=id;replacements.set(filter.id,id);defs.append(copy);
+    }
+    for(const element of $$('[style]',layer)){
+      const value=element.style.getPropertyValue('--glass-refraction');
+      if(value)element.style.setProperty('--glass-refraction',value.replace(/#(clear-glass-\d+)/g,(_,id)=>`#${replacements.get(id)||id}`));
+    }
+    layer.append(svg);document.body.append(layer);return layer;
+  }
+
+  async function prepareImages(root,signal){
+    const sources=[...new Set($$('img',root).map(img=>img.currentSrc||img.src).filter(Boolean))];
+    if(!sources.length||signal.aborted)return;
+    const images=sources.map(src=>{const image=new Image();image.src=src;return image.decode?.().catch(()=>{});});
+    // A slow or unavailable optional image must never block navigation indefinitely.
+    let timer;let onAbort;
+    try{
+      await Promise.race([
+        Promise.all(images),
+        new Promise(resolve=>{timer=setTimeout(resolve,700);onAbort=resolve;signal.addEventListener('abort',onAbort,{once:true});})
+      ]);
+    }finally{clearTimeout(timer);if(onAbort)signal.removeEventListener('abort',onAbort);}
   }
 
   document.addEventListener('click',event=>{
@@ -313,14 +387,16 @@
       element.style.setProperty('--glass-refraction',`url("#${state.filter.id}")`);
     }
     const observer=typeof ResizeObserver==='function'?new ResizeObserver(items=>{items.forEach(item=>update(item.target));}):null;
-    function refresh() {
-      cancelAnimationFrame(refreshFrame);refreshFrame=requestAnimationFrame(()=>{
+    function refresh({ immediate=false }={}) {
+      cancelAnimationFrame(refreshFrame);
+      const apply=()=>{
         for(const [element,state]of tracked)if(!element.isConnected){observer?.unobserve(element);state.filter?.remove();tracked.delete(element);}
-        $$(selector).forEach(element=>{
+        $$(selector).filter(element=>!element.closest('.page-snapshot')).forEach(element=>{
           if(!tracked.has(element)){tracked.set(element,{});element.classList.add('clear-glass');observer?.observe(element);}
           update(element);
         });
-      });
+      };
+      if(immediate)apply();else refreshFrame=requestAnimationFrame(apply);
     }
     document.addEventListener('pointermove',event=>{
       if(!finePointer.matches||reducedMotion.matches||transparency.matches||contrast.matches)return;
