@@ -27,12 +27,12 @@ jobs:
           node-version: 24
           package-manager-cache: false
       - name: Validate and generate pages
-        working-directory: personal_home
+        working-directory: personal-home
         run: npm run check
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: personal_home/dist
+          path: personal-home/dist
       - name: Publish
         id: deployment
         uses: actions/deploy-pages@v5
