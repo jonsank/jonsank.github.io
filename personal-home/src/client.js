@@ -18,7 +18,6 @@
   let requestController;
   let cleanupPage = () => {};
   let enteringAnimation;
-  let pageTransition;
   let fallbackTransition;
 
   function makeKey() { return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`; }
@@ -55,7 +54,7 @@
     const theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
     document.documentElement.dataset.theme = theme;
     try { localStorage.setItem('personal-site-theme', theme); } catch { /* Storage is optional. */ }
-    updateTheme();
+    updateTheme();glassEffects.refresh();
   });
   updateTheme();
 
@@ -144,7 +143,7 @@
   }
   function samePage(a,b) { return a.pathname===b.pathname&&a.search===b.search; }
   function stopPageTransition(){
-    pageTransition?.skipTransition();enteringAnimation?.cancel();
+    enteringAnimation?.cancel();
     if(fallbackTransition){fallbackTransition.animation?.cancel();fallbackTransition.layer.remove();fallbackTransition=null;}
   }
   function cancelNavigation() {
@@ -214,21 +213,14 @@
         const heading=$('h1',main);heading?.setAttribute('tabindex','-1');heading?.focus({preventScroll:true});
         scrollToTarget(url,pop?(scrollPositions.get(currentKey)||popState?.sitePosition):null);
       };
-      if(!reducedMotion.matches&&typeof document.startViewTransition==='function'){
-        document.documentElement.dataset.pageTransition='native';
-        // Capture the current viewport, then reveal the new one over it. There is
-        // no frame where both pages are transparent, including during scroll reset.
-        const transition=document.startViewTransition(commitPage);
-        pageTransition=transition;
-        transition.ready.catch(()=>{});
-        transition.finished.catch(()=>{}).finally(()=>{if(pageTransition===transition)pageTransition=null;});
-        await transition.updateCallbackDone;
-      }else{
+      // Keep the real header live: a named View Transition header isolates its
+      // backdrop and prevents the glass from sampling the scrolling page below.
+      {
         document.documentElement.dataset.pageTransition=reducedMotion.matches?'reduced':'snapshot';
         const snapshot=!reducedMotion.matches&&typeof main.animate==='function'?capturePage():null;
         commitPage();
-        // The previous viewport fades over the fully painted next page. Both the
-        // native and fallback paths retain an opaque frame throughout the change.
+        // The previous content fades over the painted next page below the live
+        // header. The viewport stays covered throughout the handoff.
         if(snapshot){
           const style=getComputedStyle(document.documentElement);
           const options={
@@ -330,12 +322,11 @@
   document.documentElement.dataset.navigationSession=makeKey();
 
   function createClearGlass() {
-    const selector='.header-inner.glass, .collection-tabs.glass, .button.glass-control, .theme-toggle.glass-control, .search-box.glass-control';
+    const selector='.header-inner.glass, .collection-tabs.glass, .nav-lens, .button.glass-control, .theme-toggle.glass-control, .search-box.glass-control';
     const transparency=matchMedia('(prefers-reduced-transparency: reduce)');
     const contrast=matchMedia('(prefers-contrast: more)');
     const finePointer=matchMedia('(hover: hover) and (pointer: fine)');
     const ns='http://www.w3.org/2000/svg';
-    // WebKit keeps the sharp CSS material; Chromium additionally bends the backdrop at the rim.
     const opticalSupport=/(?:Chrome|Chromium|Edg)\/[0-9]/.test(navigator.userAgent)&&CSS.supports('backdrop-filter','url("#clear-glass")');
     const svg=document.createElementNS(ns,'svg');
     svg.setAttribute('aria-hidden','true');svg.setAttribute('width','0');svg.setAttribute('height','0');
@@ -343,54 +334,91 @@
     const defs=document.createElementNS(ns,'defs');svg.append(defs);document.body.append(svg);
     const tracked=new Map();const maps=new Map();
     let counter=0;let refreshFrame=0;let pointerFrame=0;let hovered;
-    function displacement(width,height,radius) {
-      const key=[width,height,radius].join(':');if(maps.has(key))return maps.get(key);
-      const canvas=document.createElement('canvas');const ratio=Math.min(1,Math.sqrt(160000/(width*height)));
+
+    function svgNode(name,attributes) {
+      const node=document.createElementNS(ns,name);
+      for(const [key,value]of Object.entries(attributes))node.setAttribute(key,String(value));
+      return node;
+    }
+    function setting(style,name,fallback) {
+      const value=parseFloat(style.getPropertyValue(name));
+      return Number.isFinite(value)?value:fallback;
+    }
+    function displacement(width,height,radius,bevel,strength,scale) {
+      const key=[width,height,radius,bevel,strength,scale].join(':');
+      if(maps.has(key))return maps.get(key);
+      const canvas=document.createElement('canvas');
+      const ratio=Math.min(1,Math.sqrt(100000/(width*height)));
       canvas.width=Math.max(1,Math.round(width*ratio));canvas.height=Math.max(1,Math.round(height*ratio));
       const ctx=canvas.getContext('2d');if(!ctx)return null;
       const image=ctx.createImageData(canvas.width,canvas.height);const pixels=image.data;
-      const bevel=Math.min(10,height*.18);const strength=Math.min(5.5,height*.07);const scale=18;
       for(let y=0;y<canvas.height;y++)for(let x=0;x<canvas.width;x++){
-        const px=(x+.5)/canvas.width*width-width/2;const py=(y+.5)/canvas.height*height-height/2;
-        const qx=Math.abs(px)-(width/2-radius);const qy=Math.abs(py)-(height/2-radius);
-        const ox=Math.max(qx,0),oy=Math.max(qy,0);const length=Math.hypot(ox,oy);
+        const px=(x+.5)/canvas.width*width-width/2,py=(y+.5)/canvas.height*height-height/2;
+        const qx=Math.abs(px)-(width/2-radius),qy=Math.abs(py)-(height/2-radius);
+        const ox=Math.max(qx,0),oy=Math.max(qy,0),length=Math.hypot(ox,oy);
         const inside=-(length+Math.min(Math.max(qx,qy),0)-radius);
-        let dx=0,dy=0;
+        let dx=0,dy=0,edge=0;
         if(inside>0&&inside<bevel){
-          const bend=Math.sin(inside/bevel*Math.PI)*strength;
-          const nx=length>0?ox/length:(qx>qy?1:0);const ny=length>0?oy/length:(qx>qy?0:1);
+          const t=inside/bevel;
+          // A smooth convex bevel: the center has no warp, the rounded rim lenses the backdrop.
+          const bend=Math.sin(Math.PI*Math.pow(t,.7))*strength;
+          const nx=length>0?ox/length:(qx>qy?1:0),ny=length>0?oy/length:(qx>qy?0:1);
           dx=-Math.sign(px)*nx*bend;dy=-Math.sign(py)*ny*bend;
+          edge=Math.pow(Math.sin(Math.PI*t),.65);
         }
         const i=(y*canvas.width+x)*4;
-        pixels[i]=Math.round(127.5+dx/scale*255);pixels[i+1]=Math.round(127.5+dy/scale*255);pixels[i+2]=128;pixels[i+3]=255;
+        pixels[i]=Math.round(127.5+dx/scale*255);
+        pixels[i+1]=Math.round(127.5+dy/scale*255);
+        // Blue stores the scattering mask; alpha stays opaque for stable displacement sampling.
+        pixels[i+2]=Math.round(edge*255);pixels[i+3]=255;
       }
-      ctx.putImageData(image,0,0);const data=canvas.toDataURL();maps.set(key,data);if(maps.size>32)maps.delete(maps.keys().next().value);return data;
+      ctx.putImageData(image,0,0);
+      const data=canvas.toDataURL();maps.set(key,data);
+      if(maps.size>48)maps.delete(maps.keys().next().value);
+      return data;
     }
     function update(element) {
       const state=tracked.get(element);if(!state||!element.isConnected)return;
-      if(!opticalSupport||transparency.matches||contrast.matches){element.style.removeProperty('--glass-refraction');return;}
-      const rect=element.getBoundingClientRect();const width=Math.round(rect.width),height=Math.round(rect.height);
+      const enabled=opticalSupport&&!transparency.matches&&!contrast.matches;
+      element.dataset.glassOptics=enabled?'refraction':'css';
+      if(!enabled){element.style.removeProperty('--glass-refraction');state.key=null;return;}
+      const width=element.offsetWidth,height=element.offsetHeight;
       if(width<2||height<2)return;
-      const radius=Math.min(parseFloat(getComputedStyle(element).borderTopLeftRadius)||24,width/2,height/2);
-      const size=[width,height,radius].join(':');if(state.size===size)return;
-      const map=displacement(width,height,radius);if(!map)return;
+      const style=getComputedStyle(element);
+      const radius=Math.max(0,Math.min(parseFloat(style.borderTopLeftRadius)||0,width/2,height/2));
+      const bevel=Math.max(1,Math.min(setting(style,'--glass-rim',14),height*.24,width*.24));
+      const strength=Math.max(0,Math.min(setting(style,'--glass-warp',8),height*.12,width*.12));
+      const scatter=Math.max(0,Math.min(setting(style,'--glass-scatter',.65),2));
+      const scale=Math.max(18,strength*2.2);
+      const key=[width,height,radius,bevel,strength,scatter,scale].join(':');
+      if(state.key===key)return;
+      const map=displacement(width,height,radius,bevel,strength,scale);if(!map)return;
       if(!state.filter){
-        state.filter=document.createElementNS(ns,'filter');state.filter.id=`clear-glass-${++counter}`;
-        state.filter.setAttribute('filterUnits','userSpaceOnUse');state.filter.setAttribute('primitiveUnits','userSpaceOnUse');state.filter.setAttribute('color-interpolation-filters','sRGB');
-        const image=document.createElementNS(ns,'feImage');image.setAttribute('result','rim-map');image.setAttribute('preserveAspectRatio','none');
-        const warp=document.createElementNS(ns,'feDisplacementMap');warp.setAttribute('in','SourceGraphic');warp.setAttribute('in2','rim-map');warp.setAttribute('scale','18');warp.setAttribute('xChannelSelector','R');warp.setAttribute('yChannelSelector','G');warp.setAttribute('result','refracted');
-        const soften=document.createElementNS(ns,'feGaussianBlur');soften.setAttribute('in','refracted');soften.setAttribute('stdDeviation','.3');
-        state.filter.append(image,warp,soften);defs.append(state.filter);state.image=image;
+        state.filter=svgNode('filter',{id:'clear-glass-'+(++counter),filterUnits:'userSpaceOnUse',primitiveUnits:'userSpaceOnUse','color-interpolation-filters':'sRGB'});
+        state.image=svgNode('feImage',{result:'rim-map',preserveAspectRatio:'none'});
+        state.warp=svgNode('feDisplacementMap',{in:'SourceGraphic',in2:'rim-map',xChannelSelector:'R',yChannelSelector:'G',result:'refracted'});
+        const mask=svgNode('feColorMatrix',{in:'rim-map',type:'matrix',values:'0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 1 0 0',result:'edge-mask'});
+        state.soften=svgNode('feGaussianBlur',{in:'refracted',result:'scattered'});
+        const rim=svgNode('feComposite',{in:'scattered',in2:'edge-mask',operator:'in',result:'soft-rim'});
+        const center=svgNode('feComposite',{in:'refracted',in2:'edge-mask',operator:'out',result:'clear-center'});
+        // Add premultiplied masked layers so their alpha sums to one, avoiding a milky seam.
+        const combine=svgNode('feComposite',{in:'soft-rim',in2:'clear-center',operator:'arithmetic',k1:0,k2:1,k3:1,k4:0});
+        state.filter.append(state.image,state.warp,mask,state.soften,rim,center,combine);defs.append(state.filter);
       }
-      state.size=size;state.filter.setAttribute('x','0');state.filter.setAttribute('y','0');state.filter.setAttribute('width',width);state.filter.setAttribute('height',height);
-      state.image.setAttribute('width',width);state.image.setAttribute('height',height);state.image.setAttribute('href',map);
-      element.style.setProperty('--glass-refraction',`url("#${state.filter.id}")`);
+      state.key=key;
+      for(const [name,value]of Object.entries({x:0,y:0,width,height}))state.filter.setAttribute(name,String(value));
+      state.image.setAttribute('width',String(width));state.image.setAttribute('height',String(height));state.image.setAttribute('href',map);
+      state.warp.setAttribute('scale',String(scale));state.soften.setAttribute('stdDeviation',String(scatter));
+      element.style.setProperty('--glass-refraction','url("#'+state.filter.id+'")');
     }
-    const observer=typeof ResizeObserver==='function'?new ResizeObserver(items=>{items.forEach(item=>update(item.target));}):null;
-    function refresh({ immediate=false }={}) {
+    // Coalesce resize callbacks; moving a lens only needs a new map when its layout size changes.
+    const observer=typeof ResizeObserver==='function'?new ResizeObserver(()=>refresh()):null;
+    function refresh({immediate=false}={}) {
       cancelAnimationFrame(refreshFrame);
       const apply=()=>{
-        for(const [element,state]of tracked)if(!element.isConnected){observer?.unobserve(element);state.filter?.remove();tracked.delete(element);}
+        for(const [element,state]of tracked)if(!element.isConnected){
+          observer?.unobserve(element);state.filter?.remove();tracked.delete(element);
+        }
         $$(selector).filter(element=>!element.closest('.page-snapshot')).forEach(element=>{
           if(!tracked.has(element)){tracked.set(element,{});element.classList.add('clear-glass');observer?.observe(element);}
           update(element);
@@ -398,21 +426,31 @@
       };
       if(immediate)apply();else refreshFrame=requestAnimationFrame(apply);
     }
+    function resetLight(surface){
+      for(const element of[surface,...$$('.nav-lens',surface)]){
+        element.style.removeProperty('--glint-x');element.style.removeProperty('--glint-y');element.style.removeProperty('--glint-angle');
+      }
+    }
+    function lightAt(surface,x,y){
+      for(const element of[surface,...$$('.nav-lens',surface)]){
+        if(!element.isConnected)continue;
+        const rect=element.getBoundingClientRect();
+        element.style.setProperty('--glint-x',Math.max(0,Math.min(100,(x-rect.left)/Math.max(1,rect.width)*100))+'%');
+        element.style.setProperty('--glint-y',Math.max(0,Math.min(100,(y-rect.top)/Math.max(1,rect.height)*100))+'%');
+        element.style.setProperty('--glint-angle',(Math.atan2(y-rect.top-rect.height/2,x-rect.left-rect.width/2)*180/Math.PI+90)+'deg');
+      }
+    }
     document.addEventListener('pointermove',event=>{
       if(!finePointer.matches||reducedMotion.matches||transparency.matches||contrast.matches)return;
       const surface=event.target.closest?.('.clear-glass');
-      if(hovered&&hovered!==surface){hovered.style.removeProperty('--glint-x');hovered.style.removeProperty('--glint-y');hovered.style.removeProperty('--glint-angle');}
+      if(hovered&&hovered!==surface)resetLight(hovered);
       hovered=surface;if(!surface)return;
       const x=event.clientX,y=event.clientY;
-      cancelAnimationFrame(pointerFrame);pointerFrame=requestAnimationFrame(()=>{
-        if(!surface.isConnected)return;const rect=surface.getBoundingClientRect();
-        surface.style.setProperty('--glint-x',`${Math.max(0,Math.min(100,(x-rect.left)/rect.width*100))}%`);
-        surface.style.setProperty('--glint-y',`${Math.max(0,Math.min(100,(y-rect.top)/rect.height*100))}%`);
-        surface.style.setProperty('--glint-angle',`${Math.atan2(y-rect.top-rect.height/2,x-rect.left-rect.width/2)*180/Math.PI+90}deg`);
-      });
+      cancelAnimationFrame(pointerFrame);
+      pointerFrame=requestAnimationFrame(()=>lightAt(surface,x,y));
     },{passive:true});
-    document.addEventListener('pointerleave',()=>{if(hovered){hovered.style.removeProperty('--glint-x');hovered.style.removeProperty('--glint-y');hovered.style.removeProperty('--glint-angle');hovered=null;}});
-    for(const media of[transparency,contrast])media.addEventListener('change',()=>{for(const state of tracked.values())state.size=null;refresh();});
+    document.addEventListener('pointerleave',()=>{if(hovered){resetLight(hovered);hovered=null;}});
+    for(const media of[transparency,contrast])media.addEventListener('change',()=>refresh());
     return{refresh};
   }
 })();

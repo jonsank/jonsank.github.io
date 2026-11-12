@@ -82,3 +82,27 @@ npm run check  # 生成页面，检查链接并验证新增栏目
 `npm run check` 会检查全部内部链接、静态资源、项目子路径、每页主标题，以及动态新增栏目和文章的生成行为。GitHub Actions 工作流需要在用户的 GitHub 仓库中实际运行后才能验证云端部署。
 
 设计参考：[Apple Materials](https://developer.apple.com/design/human-interface-guidelines/materials)。静态内容结构参考过 AstroPaper 和 AstroWind；没有复制它们的源码。头像由用户提供，不含外部字体、统计、远程图片或第三方脚本。
+
+## 玻璃折射、散射与过渡维护
+
+导航外壳、分类栏、选中胶囊及部分控件使用圆角形状的位移贴图。Chromium 中通过 SVG 背景滤镜模拟边缘折射；蓝色通道提供边缘遮罩，仅在边缘混合柔化结果，中央保持清晰。动态高光同时跟随表面和选中胶囊。Safari、Firefox 使用 CSS 玻璃兼容效果；不保证与 Chromium 的背景畸变一致。
+
+在 `src/styles.css` 末尾的 Optical material controls 中调整：
+
+```css
+:root {
+  --glass-warp: 8px;       /* 折射位移上限，实际受控件尺寸限制 */
+  --glass-rim: 14px;       /* 边缘畸变区域宽度 */
+  --glass-scatter: .65px;  /* 边缘柔化，中央不使用这层模糊 */
+  --lens-fill: rgba(255,255,255,.08);
+  --lens-glint: rgba(255,255,255,.38);
+}
+```
+
+`.nav-lens` 单独使用 `5px / 8px / .35px`，以适应较小的胶囊。深色模式的透镜底色和高光另有覆盖。普通 `:root` 中的 `--glass`、`--control` 控制白色底色的不透明度，值越大越实；当前浅色为 `.14 / .20`，深色为 `.22 / .20`。`--glass-blur` 是 CSS 兼容模式的模糊参数。
+
+顶栏和分类栏使用独立的 `.glass-material` 背景层，避免嵌套背景滤镜阻断选中胶囊的采样。保留模板里的背景 span 和 `.nav-lens.clear-glass { position:absolute }`。不要给顶栏添加 `view-transition-name`，它会隔离顶栏的背景采样；也不要对整块控件使用 `filter` 或 `opacity` 来代替背景效果，以免影响文字。
+
+页面通过正文临时叠层交接，真实顶栏始终保留，玻璃与滑块可持续渲染。时长和位移仍由 `--page-duration`、`--page-ease`、`--page-shift` 控制。减少动态时直接切换；减少透明或增强对比度时使用清晰底色。临时叠层和离开页面的滤镜会在完成后清理。
+
+验证时在 Chrome 中滚动，让插画或文字经过顶栏后方，检查边缘的局部偏移与中央清晰度；同时检查主导航、子分类、快速连点、搜索返回、手机布局和深浅色。大幅增加不透明底色会遮住背景畸变，即使位移滤镜仍在工作。
