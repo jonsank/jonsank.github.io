@@ -3,6 +3,7 @@
   const $ = (s, root = document) => root.querySelector(s);
   const $$ = (s, root = document) => [...root.querySelectorAll(s)];
   const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+  const glassEffects = createClearGlass();
   const main = $('#main');
   const revision = $('meta[name="site-revision"]')?.content;
   const siteRoot = new URL($('meta[name="site-root"]')?.content || './', location.href);
@@ -124,6 +125,7 @@
       $('#reset-search')?.addEventListener('click',()=>{search.value='';applySearch();search.focus();},{signal:controller.signal});
     }
     $$('.collection-tabs').forEach(nav=>{if(!lenses.has(nav))positionLens(nav);});
+    glassEffects.refresh();
   }
   mountPage(renderedURL);
 
@@ -252,4 +254,89 @@
   document.addEventListener('click',event=>{if(event.target.closest('[data-copy-link]'))copyLink();});
   document.documentElement.dataset.navigation='instant';
   document.documentElement.dataset.navigationSession=makeKey();
+
+  function createClearGlass() {
+    const selector='.header-inner.glass, .collection-tabs.glass, .button.glass-control, .theme-toggle.glass-control, .search-box.glass-control';
+    const transparency=matchMedia('(prefers-reduced-transparency: reduce)');
+    const contrast=matchMedia('(prefers-contrast: more)');
+    const finePointer=matchMedia('(hover: hover) and (pointer: fine)');
+    const ns='http://www.w3.org/2000/svg';
+    // WebKit keeps the sharp CSS material; Chromium additionally bends the backdrop at the rim.
+    const opticalSupport=/(?:Chrome|Chromium|Edg)\/[0-9]/.test(navigator.userAgent)&&CSS.supports('backdrop-filter','url("#clear-glass")');
+    const svg=document.createElementNS(ns,'svg');
+    svg.setAttribute('aria-hidden','true');svg.setAttribute('width','0');svg.setAttribute('height','0');
+    svg.style.cssText='position:fixed;inset:0;pointer-events:none;overflow:hidden';
+    const defs=document.createElementNS(ns,'defs');svg.append(defs);document.body.append(svg);
+    const tracked=new Map();const maps=new Map();
+    let counter=0;let refreshFrame=0;let pointerFrame=0;let hovered;
+    function displacement(width,height,radius) {
+      const key=[width,height,radius].join(':');if(maps.has(key))return maps.get(key);
+      const canvas=document.createElement('canvas');const ratio=Math.min(1,Math.sqrt(160000/(width*height)));
+      canvas.width=Math.max(1,Math.round(width*ratio));canvas.height=Math.max(1,Math.round(height*ratio));
+      const ctx=canvas.getContext('2d');if(!ctx)return null;
+      const image=ctx.createImageData(canvas.width,canvas.height);const pixels=image.data;
+      const bevel=Math.min(10,height*.18);const strength=Math.min(5.5,height*.07);const scale=18;
+      for(let y=0;y<canvas.height;y++)for(let x=0;x<canvas.width;x++){
+        const px=(x+.5)/canvas.width*width-width/2;const py=(y+.5)/canvas.height*height-height/2;
+        const qx=Math.abs(px)-(width/2-radius);const qy=Math.abs(py)-(height/2-radius);
+        const ox=Math.max(qx,0),oy=Math.max(qy,0);const length=Math.hypot(ox,oy);
+        const inside=-(length+Math.min(Math.max(qx,qy),0)-radius);
+        let dx=0,dy=0;
+        if(inside>0&&inside<bevel){
+          const bend=Math.sin(inside/bevel*Math.PI)*strength;
+          const nx=length>0?ox/length:(qx>qy?1:0);const ny=length>0?oy/length:(qx>qy?0:1);
+          dx=-Math.sign(px)*nx*bend;dy=-Math.sign(py)*ny*bend;
+        }
+        const i=(y*canvas.width+x)*4;
+        pixels[i]=Math.round(127.5+dx/scale*255);pixels[i+1]=Math.round(127.5+dy/scale*255);pixels[i+2]=128;pixels[i+3]=255;
+      }
+      ctx.putImageData(image,0,0);const data=canvas.toDataURL();maps.set(key,data);if(maps.size>32)maps.delete(maps.keys().next().value);return data;
+    }
+    function update(element) {
+      const state=tracked.get(element);if(!state||!element.isConnected)return;
+      if(!opticalSupport||transparency.matches||contrast.matches){element.style.removeProperty('--glass-refraction');return;}
+      const rect=element.getBoundingClientRect();const width=Math.round(rect.width),height=Math.round(rect.height);
+      if(width<2||height<2)return;
+      const radius=Math.min(parseFloat(getComputedStyle(element).borderTopLeftRadius)||24,width/2,height/2);
+      const size=[width,height,radius].join(':');if(state.size===size)return;
+      const map=displacement(width,height,radius);if(!map)return;
+      if(!state.filter){
+        state.filter=document.createElementNS(ns,'filter');state.filter.id=`clear-glass-${++counter}`;
+        state.filter.setAttribute('filterUnits','userSpaceOnUse');state.filter.setAttribute('primitiveUnits','userSpaceOnUse');state.filter.setAttribute('color-interpolation-filters','sRGB');
+        const image=document.createElementNS(ns,'feImage');image.setAttribute('result','rim-map');image.setAttribute('preserveAspectRatio','none');
+        const warp=document.createElementNS(ns,'feDisplacementMap');warp.setAttribute('in','SourceGraphic');warp.setAttribute('in2','rim-map');warp.setAttribute('scale','18');warp.setAttribute('xChannelSelector','R');warp.setAttribute('yChannelSelector','G');warp.setAttribute('result','refracted');
+        const soften=document.createElementNS(ns,'feGaussianBlur');soften.setAttribute('in','refracted');soften.setAttribute('stdDeviation','.3');
+        state.filter.append(image,warp,soften);defs.append(state.filter);state.image=image;
+      }
+      state.size=size;state.filter.setAttribute('x','0');state.filter.setAttribute('y','0');state.filter.setAttribute('width',width);state.filter.setAttribute('height',height);
+      state.image.setAttribute('width',width);state.image.setAttribute('height',height);state.image.setAttribute('href',map);
+      element.style.setProperty('--glass-refraction',`url("#${state.filter.id}")`);
+    }
+    const observer=typeof ResizeObserver==='function'?new ResizeObserver(items=>{items.forEach(item=>update(item.target));}):null;
+    function refresh() {
+      cancelAnimationFrame(refreshFrame);refreshFrame=requestAnimationFrame(()=>{
+        for(const [element,state]of tracked)if(!element.isConnected){observer?.unobserve(element);state.filter?.remove();tracked.delete(element);}
+        $$(selector).forEach(element=>{
+          if(!tracked.has(element)){tracked.set(element,{});element.classList.add('clear-glass');observer?.observe(element);}
+          update(element);
+        });
+      });
+    }
+    document.addEventListener('pointermove',event=>{
+      if(!finePointer.matches||reducedMotion.matches||transparency.matches||contrast.matches)return;
+      const surface=event.target.closest?.('.clear-glass');
+      if(hovered&&hovered!==surface){hovered.style.removeProperty('--glint-x');hovered.style.removeProperty('--glint-y');hovered.style.removeProperty('--glint-angle');}
+      hovered=surface;if(!surface)return;
+      const x=event.clientX,y=event.clientY;
+      cancelAnimationFrame(pointerFrame);pointerFrame=requestAnimationFrame(()=>{
+        if(!surface.isConnected)return;const rect=surface.getBoundingClientRect();
+        surface.style.setProperty('--glint-x',`${Math.max(0,Math.min(100,(x-rect.left)/rect.width*100))}%`);
+        surface.style.setProperty('--glint-y',`${Math.max(0,Math.min(100,(y-rect.top)/rect.height*100))}%`);
+        surface.style.setProperty('--glint-angle',`${Math.atan2(y-rect.top-rect.height/2,x-rect.left-rect.width/2)*180/Math.PI+90}deg`);
+      });
+    },{passive:true});
+    document.addEventListener('pointerleave',()=>{if(hovered){hovered.style.removeProperty('--glint-x');hovered.style.removeProperty('--glint-y');hovered.style.removeProperty('--glint-angle');hovered=null;}});
+    for(const media of[transparency,contrast])media.addEventListener('change',()=>{for(const state of tracked.values())state.size=null;refresh();});
+    return{refresh};
+  }
 })();
